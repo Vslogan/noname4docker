@@ -27,6 +27,8 @@ const failedJson = <T = any>(code: number, message?: string): JsonResult<T> => (
 export const defaultConfig = {
 	server: false,
 	port: 8089,
+	/** 监听地址，默认仅本机可访问；容器部署时传入 `--host=0.0.0.0` */
+	host: "localhost",
 	debug: false,
 	dirname: cwd(),
 };
@@ -60,6 +62,11 @@ function createFsHandler(dirname: string) {
 
 export default function createApp(config: Partial<typeof defaultConfig> = {}) {
 	const cfg = { ...defaultConfig, ...config };
+	// 命令行传入的参数都是字符串（如 `--port=8089`），这里统一转成数字
+	cfg.port = Number(cfg.port);
+	if (!Number.isInteger(cfg.port) || cfg.port < 0 || cfg.port > 65535) {
+		throw new Error(`Invalid port: ${cfg.port}`);
+	}
 	cfg.dirname = path.resolve(cfg.dirname);
 	if (cfg.debug) console.log(cfg);
 	const app = Fastify({
@@ -204,7 +211,7 @@ export default function createApp(config: Partial<typeof defaultConfig> = {}) {
 	});
 
 	const callback = () => {
-		console.log(`Server listening on port ${cfg.port}`);
+		console.log(`Server listening on ${cfg.host}:${cfg.port}`);
 		if (!cfg.server && !cfg.debug) exec(`start http://localhost:${cfg.port}/`);
 	};
 
@@ -221,7 +228,7 @@ export default function createApp(config: Partial<typeof defaultConfig> = {}) {
 	// } else {
 	// 	app.listen(config.port, callback);
 	// }
-	app.listen({ port: cfg.port }, callback);
+	app.listen({ port: cfg.port, host: cfg.host }, callback);
 
 	return app;
 }
