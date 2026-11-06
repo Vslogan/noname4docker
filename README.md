@@ -62,6 +62,22 @@ PC:  <https://github.com/nonameShijian/noname/releases/tag/v1.75>
 
 ---
 
+## Docker 一键部署
+
+仓库内置了容器化文件与运维命令，适合在服务器/NAS 上长期运行：
+
+```bash
+sudo ./install.sh      # 安装 noname 命令
+noname start           # 首次构建镜像并启动（网页 8089、联机 8082）
+noname info            # 查看运行状态、端口映射、资源占用
+noname update          # 与 GitHub Release 对比版本，有更新则重新构建并重启
+```
+
+镜像只包含构建产物与服务端运行依赖，不含源码仓库、`node_modules` 与构建工具；扩展目录通过数据卷持久化。
+完整说明（配置项、更新机制、反向代理、常见问题）见 [docs/docker-deploy.md](./docs/docker-deploy.md)。
+
+---
+
 最近有一伙人号称是《无名杀十周年》的开发团队，宣称《无名杀十周年》“全新无名杀，比旧版拥有更多武将，兼容更多扩展”，实际上:
 
 - 《无名杀十周年》（原《无名杀清瑶版》）由无名杀 v1.9.124 修改而来，属于无名杀的一种**Fork**，并非“全新无名杀”；且《无名杀十周年》开发团队**公然违反 GPL-3.0 协议**，详情请看[这里](https://github.com/github/dmca/blob/master/2023/09/2023-09-20-noname.md)、[这里](https://tieba.baidu.com/p/8623890806)以及[这里](https://tieba.baidu.com/p/8624582238)。

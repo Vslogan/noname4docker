@@ -1,0 +1,947 @@
+#!/usr/bin/env bash
+#
+# 无名杀（noname）部署管理命令
+#
+#   noname start            构建（首次）并启动全部服务
+#   noname kill             停止并移除容器（保留镜像与数据卷）
+#   noname reboot           重启服务
+#   noname info             查看运行状态、端口、资源占用等运维信息
+#   noname update           检查 GitHub Release 最新版本，不一致则重新拉取源码构建并重启
+#
+# 辅助命令：
+#   noname build            用当前目录的源码重新构建镜像
+#   noname logs [-f]        查看服务日志
+#   noname version          查看命令行与部署版本
+#   noname help             显示帮助
+#
+# 环境变量：
+#   NONAME_HOME             项目根目录（默认取本脚本所在仓库）
+#   NONAME_IMAGE            镜像名（默认 noname）
+#   NONAME_UPSTREAM         上游仓库地址（默认 https://github.com/libnoname/noname.git）
+#   GITHUB_TOKEN            可选，用于避免 GitHub API 限流
+#   NONAME_KEEP_IMAGES      更新后保留的历史版本镜像数量（默认 2）
+#
+# 详细说明见 docs/docker-deploy.md
+
+set -euo pipefail
+
+CLI_VERSION="1.0.0"
+PROG="${0##*/}"
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+	C_RESET=$'\033[0m'
+	C_HEAD=$'\033[1;36m'
+	C_INFO=$'\033[1;32m'
+	C_WARN=$'\033[1;33m'
+	C_ERR=$'\033[1;31m'
+	C_DIM=$'\033[2m'
+else
+	C_RESET=""
+	C_HEAD=""
+	C_INFO=""
+	C_WARN=""
+	C_ERR=""
+	C_DIM=""
+fi
+
+info() { printf '%s==>%s %s\n' "$C_INFO" "$C_RESET" "$*"; }
+step() { printf '  %s-%s %s\n' "$C_DIM" "$C_RESET" "$*"; }
+warn() { printf '%s警告：%s%s\n' "$C_WARN" "$C_RESET" "$*" >&2; }
+die() {
+	printf '%s错误：%s%s\n' "$C_ERR" "$C_RESET" "$*" >&2
+	exit 1
+}
+
+usage() {
+	cat <<EOF
+${C_HEAD}无名杀部署管理命令${C_RESET} v${CLI_VERSION}
+
+用法：${PROG} <命令> [选项]
+
+命令：
+  start [--build]      构建（镜像不存在时）并启动全部服务
+  kill [--purge] [-y]  停止并移除容器；--purge 同时删除数据卷（扩展目录）与状态
+  reboot [--recreate]  重启服务；--recreate 强制重新创建容器
+  info                 查看运行状态、端口映射、资源占用与调试信息
+  update [选项]        检查并更新到 GitHub Release 最新版本，完成后自动重启
+  build                用当前目录源码重新构建镜像（构建后重启服务）
+  logs [-f] [服务名]   查看日志，-f 表示持续输出
+  version              查看命令行与已部署版本
+  help                 显示本帮助
+
+update 选项：
+  --check              只检查是否有新版本（有更新时退出码 10）
+  --force              即使版本一致也强制重新拉取源码并构建
+  --tag <标签>         指定要部署的版本，如 --tag v1.11.7
+  --no-restart         构建完成后不自动重启服务
+  --prune              构建成功后清理旧镜像（默认保留 2 个版本，见 NONAME_KEEP_IMAGES）
+
+示例：
+  ${PROG} start
+  ${PROG} info
+  ${PROG} update --check
+  ${PROG} update
+  ${PROG} logs -f web
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# 项目定位
+# ---------------------------------------------------------------------------
+
+resolve_root() {
+	local src="${BASH_SOURCE[0]}" dir
+	while [ -L "$src" ]; do
+		dir="$(cd -P "$(dirname "$src")" && pwd)"
+		src="$(readlink "$src")"
+		case "$src" in
+		/*) ;;
+		*) src="$dir/$src" ;;
+		esac
+	done
+	cd -P "$(dirname "$src")/.." && pwd
+}
+
+ROOT="${NONAME_HOME:-$(resolve_root)}"
+COMPOSE_FILE="${NONAME_COMPOSE_FILE:-$ROOT/docker-compose.yml}"
+STATE_DIR="$ROOT/.noname"
+STATE_FILE="$STATE_DIR/state.env"
+
+[ -f "$COMPOSE_FILE" ] || die "找不到 $COMPOSE_FILE，NONAME_HOME 或 NONAME_COMPOSE_FILE 设置有误"
+
+# 读取项目根目录的 .env（与 docker compose 行为一致；已存在的环境变量优先）
+load_dotenv() {
+	local file="${NONAME_ENV_FILE:-$ROOT/.env}" line key val
+	[ -f "$file" ] || return 0
+	while IFS= read -r line || [ -n "$line" ]; do
+		line="${line%$'\r'}"
+		case "$line" in
+		"" | \#*) continue ;;
+		*=*) ;;
+		*) continue ;;
+		esac
+		key="${line%%=*}"
+		val="${line#*=}"
+		key="${key//[[:space:]]/}"
+		case "$key" in
+		export) continue ;;
+		esac
+		printf '%s' "$key" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*$' || continue
+		case "$val" in
+		\"*\") val="${val#\"}"; val="${val%\"}" ;;
+		\'*\') val="${val#\'}"; val="${val%\'}" ;;
+		esac
+		val="${val%"${val##*[![:space:]]}"}"
+		if [ -z "${!key+x}" ]; then
+			export "$key=$val"
+		fi
+	done <"$file"
+}
+
+load_dotenv
+
+UPSTREAM="${NONAME_UPSTREAM:-https://github.com/libnoname/noname.git}"
+RELEASE_REPO="libnoname/noname"
+
+IMAGE="${NONAME_IMAGE:-noname}"
+DEFAULT_LOCAL_TAG="local"
+
+DC=()
+
+require_docker() {
+	command -v docker >/dev/null 2>&1 || die "未找到 docker，请先安装 Docker Engine"
+	docker info >/dev/null 2>&1 || die "无法连接 Docker 守护进程（权限不足？可使用 sudo，或将当前用户加入 docker 组）"
+	if docker compose version >/dev/null 2>&1; then
+		DC=(docker compose)
+	elif command -v docker-compose >/dev/null 2>&1; then
+		DC=(docker-compose)
+	else
+		die "未找到 docker compose，请安装 Docker Compose v2 插件"
+	fi
+}
+
+compose() {
+	"${DC[@]}" --project-directory "$ROOT" --file "$COMPOSE_FILE" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# 状态文件：记录当前部署的镜像标签与应用版本
+# ---------------------------------------------------------------------------
+
+STATE_TAG=""
+STATE_VERSION=""
+STATE_SOURCE=""
+STATE_UPDATED_AT=""
+
+load_state() {
+	if [ -f "$STATE_FILE" ]; then
+		# shellcheck disable=SC1090
+		. "$STATE_FILE"
+	fi
+	STATE_TAG="${NONAME_STATE_TAG:-}"
+	STATE_VERSION="${NONAME_STATE_VERSION:-}"
+	STATE_SOURCE="${NONAME_STATE_SOURCE:-}"
+	STATE_UPDATED_AT="${NONAME_STATE_UPDATED_AT:-}"
+}
+
+save_state() {
+	local tag="$1" version="$2" source="$3"
+	mkdir -p "$STATE_DIR"
+	cat >"$STATE_FILE" <<EOF
+# 由 ${PROG} 自动生成，请勿手工编辑
+NONAME_STATE_TAG='${tag}'
+NONAME_STATE_VERSION='${version}'
+NONAME_STATE_SOURCE='${source}'
+NONAME_STATE_UPDATED_AT='$(date -u +%Y-%m-%dT%H:%M:%SZ)'
+EOF
+	load_state
+}
+
+effective_tag() {
+	# 优先级：命令行环境变量 > 部署状态文件 > 本地构建标签
+	if [ -n "${NONAME_TAG:-}" ]; then
+		printf '%s' "$NONAME_TAG"
+	elif [ -n "$STATE_TAG" ]; then
+		printf '%s' "$STATE_TAG"
+	else
+		printf '%s' "$DEFAULT_LOCAL_TAG"
+	fi
+}
+
+export_compose_env() {
+	local tag
+	tag="$(effective_tag)"
+	export NONAME_TAG="$tag"
+	if [ -n "$STATE_VERSION" ]; then
+		export NONAME_VERSION="$STATE_VERSION"
+	fi
+}
+
+image_ref() { printf '%s:%s' "$IMAGE" "$(effective_tag)"; }
+
+image_exists() { docker image inspect "$1" >/dev/null 2>&1; }
+
+image_version_label() {
+	docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.version"}}' "$1" 2>/dev/null || true
+}
+
+is_release_tag() { printf '%s' "$1" | grep -Eq '^v[0-9]+(\.[0-9]+)*$'; }
+
+# ---------------------------------------------------------------------------
+# 版本工具
+# ---------------------------------------------------------------------------
+
+local_source_commit() {
+	git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf 'local'
+}
+
+local_source_version() {
+	local sha
+	sha="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || true)"
+	if [ -n "$sha" ]; then
+		printf 'dev-%s' "$sha"
+	else
+		printf 'dev'
+	fi
+}
+
+version_gt() {
+	# $1 是否比 $2 新（需要 GNU sort -V）
+	[ "$1" != "$2" ] || return 1
+	local newest
+	newest="$(printf '%s\n%s\n' "$1" "$2" | sort -V 2>/dev/null | tail -n 1)"
+	[ "$newest" = "$1" ]
+}
+
+resolve_latest_release() {
+	local body="" tag="" api auth=()
+	if [ -n "${GITHUB_TOKEN:-}" ]; then
+		auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+	fi
+	api="https://api.github.com/repos/${RELEASE_REPO}/releases/latest"
+
+	if command -v curl >/dev/null 2>&1; then
+		body="$(curl -fsSL --connect-timeout 10 --max-time 30 \
+			-H 'Accept: application/vnd.github+json' \
+			-H 'User-Agent: noname-deploy' \
+			${auth[@]+"${auth[@]}"} "$api" 2>/dev/null || true)"
+	fi
+
+	if [ -n "$body" ]; then
+		if command -v jq >/dev/null 2>&1; then
+			tag="$(printf '%s' "$body" | jq -r '.tag_name // empty' 2>/dev/null || true)"
+		else
+			tag="$(printf '%s' "$body" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+		fi
+	fi
+
+	if [ -z "$tag" ]; then
+		warn "无法通过 GitHub API 获取最新版本，改用 git ls-remote 读取标签"
+		tag="$(git ls-remote --tags --refs "$UPSTREAM" 'v*' 2>/dev/null |
+			awk '{ sub("refs/tags/", "", $2); print $2 }' |
+			grep -E '^v[0-9]+(\.[0-9]+)*$' |
+			sort -V | tail -n 1 || true)"
+	fi
+
+	[ -n "$tag" ] || return 1
+	printf '%s' "$tag"
+}
+
+current_version() {
+	load_state
+	export_compose_env
+	local cid label=""
+	# 优先取正在运行的容器：手工指定 NONAME_TAG 切换版本时，它能反映真实状态
+	cid="$(compose ps -a -q web 2>/dev/null | head -n 1 || true)"
+	if [ -n "$cid" ]; then
+		label="$(docker inspect -f '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$cid" 2>/dev/null || true)"
+	fi
+	if [ -z "$label" ] || [ "$label" = "<no value>" ]; then
+		label="$STATE_VERSION"
+	fi
+	if [ -z "$label" ]; then
+		label="$(image_version_label "$(image_ref)")"
+	fi
+	if [ -z "$label" ] || [ "$label" = "<no value>" ]; then
+		label="unknown"
+	fi
+	printf '%s' "$label"
+}
+
+# ---------------------------------------------------------------------------
+# 构建
+# ---------------------------------------------------------------------------
+
+BUILD_ARGS=()
+
+build_args_for() {
+	local version="$1" commit="$2" build_time="$3"
+	BUILD_ARGS=(--build-arg "NONAME_VERSION=$version"
+		--build-arg "NONAME_BUILD_COMMIT=$commit"
+		--build-arg "NONAME_BUILD_TIME=$build_time")
+	[ -n "${NONAME_NODE_VERSION:-}" ] && BUILD_ARGS+=(--build-arg "NODE_VERSION=$NONAME_NODE_VERSION")
+	[ -n "${NONAME_PNPM_VERSION:-}" ] && BUILD_ARGS+=(--build-arg "PNPM_VERSION=$NONAME_PNPM_VERSION")
+	if [ -n "${NONAME_BUILD_EXTRA_ARGS:-}" ]; then
+		# shellcheck disable=SC2206
+		BUILD_ARGS+=(${NONAME_BUILD_EXTRA_ARGS})
+	fi
+}
+
+build_image() {
+	local context="$1" version="$2" commit="$3"
+	local build_time ref
+	build_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	ref="$(image_ref)"
+	build_args_for "$version" "$commit" "$build_time"
+
+	step "镜像：$ref, $IMAGE:latest"
+	step "版本：$version（commit ${commit:0:12}）"
+	# 同时打上 latest 标签，方便直接使用 docker compose 的用户
+	docker build "${BUILD_ARGS[@]}" --tag "$ref" --tag "$IMAGE:latest" "$context"
+}
+
+build_local() {
+	local version commit
+	version="$(local_source_version)"
+	commit="$(local_source_commit)"
+	export NONAME_TAG="$DEFAULT_LOCAL_TAG"
+	export NONAME_VERSION="$version"
+
+	info "开始用当前源码构建镜像（首次构建需要数分钟）"
+	build_image "$ROOT" "$version" "$commit" || die "镜像构建失败"
+	save_state "$DEFAULT_LOCAL_TAG" "$version" "local"
+	info "镜像构建完成：$IMAGE:$DEFAULT_LOCAL_TAG"
+}
+
+# 从上游 Release 标签拉取源码并构建
+build_release() {
+	local tag="$1" src_dir commit
+	src_dir="$STATE_DIR/src/$tag"
+
+	info "拉取 $RELEASE_REPO 的 $tag 源码到 $src_dir"
+	rm -rf "$src_dir"
+	mkdir -p "$(dirname "$src_dir")"
+	info "（首次拉取完整源码约 1~2 GB，耗时取决于网络）"
+	git -c advice.detachedHead=false clone --depth 1 --branch "$tag" --single-branch "$UPSTREAM" "$src_dir" ||
+		die "源码克隆失败，请检查网络或设置 NONAME_UPSTREAM 镜像地址"
+
+	# 上游源码不包含容器化构建文件，这里把本仓库的构建文件复制进去
+	cp "$ROOT/Dockerfile" "$src_dir/Dockerfile"
+	cp "$ROOT/.dockerignore" "$src_dir/.dockerignore"
+	mkdir -p "$src_dir/docker"
+	cp "$ROOT/docker/entrypoint.sh" "$ROOT/docker/healthcheck.mjs" "$src_dir/docker/"
+
+	commit="$(git -C "$src_dir" rev-parse HEAD)"
+
+	export NONAME_TAG="$tag"
+	export NONAME_VERSION="$tag"
+
+	info "开始构建镜像 $IMAGE:$tag"
+	if ! build_image "$src_dir" "$tag" "$commit"; then
+		warn "构建失败，源码保留在 $src_dir 以便排查"
+		return 1
+	fi
+	save_state "$tag" "$tag" "release"
+	rm -rf "$src_dir"
+	rmdir "$STATE_DIR/src" 2>/dev/null || true
+	info "镜像构建完成：$IMAGE:$tag"
+}
+
+ensure_image() {
+	local ref
+	ref="$(image_ref)"
+	if image_exists "$ref"; then
+		return 0
+	fi
+	if is_release_tag "$(effective_tag)"; then
+		warn "镜像 $ref 不存在，尝试按该版本重新构建"
+		build_release "$(effective_tag)" || die "无法恢复镜像 $ref"
+	else
+		build_local
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# 运行状态
+# ---------------------------------------------------------------------------
+
+SERVICES=("web" "online")
+
+service_container() { compose ps -a -q "$1" 2>/dev/null | head -n 1 || true; }
+
+service_field() {
+	local cid="$1" template="$2"
+	docker inspect -f "$template" "$cid" 2>/dev/null || true
+}
+
+human_size() {
+	local bytes="$1"
+	if [ -z "$bytes" ] || [ "$bytes" = "<no value>" ]; then
+		printf '-'
+		return
+	fi
+	awk -v b="$bytes" 'BEGIN {
+		split("B KiB MiB GiB TiB", unit, " ");
+		i = 1;
+		while (b >= 1024 && i < 5) { b /= 1024; i++ }
+		printf (i == 1 ? "%.0f%s" : "%.1f%s"), b, unit[i]
+	}'
+}
+
+human_time() {
+	local value="$1"
+	if [ -z "$value" ] || [ "$value" = "<no value>" ]; then
+		printf '-'
+		return
+	fi
+	# Docker 返回 RFC3339（UTC），优先按本地时区展示
+	if date -d "$value" '+%Y-%m-%d %H:%M:%S' >/dev/null 2>&1; then
+		date -d "$value" '+%Y-%m-%d %H:%M:%S'
+	else
+		printf '%s' "${value%%.*}" | tr 'T' ' '
+	fi
+}
+
+lan_ip() {
+	local ip=""
+	if command -v hostname >/dev/null 2>&1; then
+		ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+	fi
+	if [ -z "$ip" ] && command -v ip >/dev/null 2>&1; then
+		ip="$(ip route get 1.1.1.1 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit } }' || true)"
+	fi
+	printf '%s' "$ip"
+}
+
+container_health() {
+	local cid="$1" health
+	health="$(service_field "$cid" '{{ if .State.Health }}{{ .State.Health.Status }}{{ else }}none{{ end }}')"
+	[ -n "$health" ] || health="none"
+	printf '%s' "$health"
+}
+
+container_ports() {
+	local cid="$1" out
+	out="$(docker inspect -f '{{ range $p, $b := .NetworkSettings.Ports }}{{ range $b }}{{ .HostIp }}:{{ .HostPort }} -> {{ $p }} {{ end }}{{ end }}' "$cid" 2>/dev/null || true)"
+	[ -n "$out" ] || out="（未映射）"
+	printf '%s' "$out"
+}
+
+any_container() {
+	local svc
+	for svc in "${SERVICES[@]}"; do
+		[ -n "$(service_container "$svc")" ] && return 0
+	done
+	return 1
+}
+
+container_running() {
+	local cid="$1" status
+	[ -n "$cid" ] || return 1
+	status="$(service_field "$cid" '{{ .State.Status }}')"
+	[ "$status" = "running" ]
+}
+
+all_running() {
+	local svc cid status
+	for svc in "${SERVICES[@]}"; do
+		cid="$(service_container "$svc")"
+		[ -n "$cid" ] || return 1
+		status="$(service_field "$cid" '{{ .State.Status }}')"
+		[ "$status" = "running" ] || return 1
+	done
+	return 0
+}
+
+all_healthy() {
+	local svc cid status health
+	for svc in "${SERVICES[@]}"; do
+		cid="$(service_container "$svc")"
+		[ -n "$cid" ] || return 1
+		status="$(service_field "$cid" '{{ .State.Status }}')"
+		[ "$status" = "running" ] || return 1
+		health="$(container_health "$cid")"
+		case "$health" in
+		healthy | none | "") ;;
+		*) return 1 ;;
+		esac
+	done
+	return 0
+}
+
+wait_healthy() {
+	local timeout="${1:-180}" waited=0
+	info "等待服务就绪（最长 ${timeout}s）"
+	while [ "$waited" -lt "$timeout" ]; do
+		if all_healthy; then
+			step "全部服务已就绪"
+			return 0
+		fi
+		sleep 3
+		waited=$((waited + 3))
+		if [ $((waited % 30)) -eq 0 ]; then
+			step "已等待 ${waited}s ..."
+		fi
+	done
+	warn "服务在 ${timeout}s 内未全部就绪，最近日志："
+	compose logs --tail 40 2>/dev/null || true
+	return 1
+}
+
+print_access() {
+	local web_port online_port ip
+	web_port="$(state_port web)"
+	online_port="$(state_port online)"
+	ip="$(lan_ip)"
+
+	printf '\n%s访问地址%s\n' "$C_HEAD" "$C_RESET"
+	printf '  网页： http://localhost:%s/\n' "$web_port"
+	[ -n "$ip" ] && printf '        http://%s:%s/\n' "$ip" "$web_port"
+	if [ -n "$ip" ]; then
+		printf '  联机： ws://%s:%s（游戏内「联机」模式地址栏填写 %s:%s）\n' "$ip" "$online_port" "$ip" "$online_port"
+	else
+		printf '  联机： ws://localhost:%s（游戏内「联机」模式地址栏填写 localhost:%s）\n' "$online_port" "$online_port"
+	fi
+	printf '  日志： %s logs -f\n' "$PROG"
+}
+
+state_port() {
+	local svc="$1" cid port
+	cid="$(service_container "$svc")"
+	if [ -n "$cid" ]; then
+		port="$(docker inspect -f '{{ range $p, $b := .NetworkSettings.Ports }}{{ range $b }}{{ .HostPort }}{{ "\n" }}{{ end }}{{ end }}' "$cid" 2>/dev/null | head -n 1)"
+		if [ -n "$port" ]; then
+			printf '%s' "$port"
+			return
+		fi
+	fi
+	case "$svc" in
+	web) printf '%s' "${NONAME_WEB_PORT:-8089}" ;;
+	online) printf '%s' "${NONAME_ONLINE_PORT:-8082}" ;;
+	esac
+}
+
+print_info_inner() {
+	local svc cid status health started ports image_name image_id restart
+	local version_image volume
+	export_compose_env
+	version_image="$(image_version_label "$(image_ref)")"
+	[ -n "$version_image" ] && [ "$version_image" != "<no value>" ] || version_image="${STATE_VERSION:-unknown}"
+
+	printf '%s无名杀部署状态%s\n' "$C_HEAD" "$C_RESET"
+	printf '  项目目录 : %s\n' "$ROOT"
+	printf '  镜像     : %s\n' "$(image_ref)"
+	printf '  应用版本 : %s' "$version_image"
+	[ -n "$STATE_UPDATED_AT" ] && printf '  %s（部署于 %s）%s' "$C_DIM" "$STATE_UPDATED_AT" "$C_RESET"
+	printf '\n'
+	printf '  部署来源 : %s\n' "${STATE_SOURCE:-local（当前目录源码）}"
+	printf '  项目名   : %s\n' "${COMPOSE_PROJECT_NAME:-noname}"
+
+	local any=0
+	for svc in "${SERVICES[@]}"; do
+		cid="$(service_container "$svc")"
+		printf '\n%s[%s]%s\n' "$C_HEAD" "$svc" "$C_RESET"
+		if [ -z "$cid" ]; then
+			printf '  状态 : %s未创建 / 未运行%s\n' "$C_WARN" "$C_RESET"
+			continue
+		fi
+		any=1
+		status="$(service_field "$cid" '{{ .State.Status }}')"
+		health="$(container_health "$cid")"
+		started="$(service_field "$cid" '{{ .State.StartedAt }}')"
+		restart="$(service_field "$cid" '{{ .RestartCount }}')"
+		image_name="$(service_field "$cid" '{{ .Config.Image }}')"
+		image_id="$(service_field "$cid" '{{ .Image }}')"
+		ports="$(container_ports "$cid")"
+
+		printf '  容器 : %s\n' "$(service_field "$cid" '{{ .Name }}' | sed 's#^/##')"
+		printf '  状态 : %s / 健康 %s / 重启 %s 次\n' "$status" "$health" "$restart"
+		printf '  启动 : %s\n' "$(human_time "$started")"
+		printf '  端口 : %s\n' "$ports"
+		printf '  镜像 : %s（%s）\n' "$image_name" "${image_id:7:12}"
+		local stats
+		stats="$(docker stats --no-stream --format '{{ .CPUPerc }}|{{ .MemUsage }}' "$cid" 2>/dev/null || true)"
+		if [ -n "$stats" ]; then
+			printf '  资源 : CPU %s / 内存 %s\n' "${stats%%|*}" "${stats#*|}"
+		fi
+	done
+
+	printf '\n%s访问与调试%s\n' "$C_HEAD" "$C_RESET"
+	if [ "$any" = "1" ]; then
+		local web_port online_port ip
+		web_port="$(state_port web)"
+		online_port="$(state_port online)"
+		ip="$(lan_ip)"
+		printf '  网页 : http://localhost:%s/\n' "$web_port"
+		[ -n "$ip" ] && printf '         http://%s:%s/\n' "$ip" "$web_port"
+		printf '  联机 : %s:%s（游戏内「联机」模式填写该地址）\n' "${ip:-localhost}" "$online_port"
+		printf '  日志 : %s logs -f\n' "$PROG"
+		printf '  进容器 : docker exec -it %s sh\n' "$(service_container web | head -c 12)"
+	else
+		printf '  服务未运行，执行 %s start 启动\n' "$PROG"
+	fi
+
+	volume="${NONAME_EXTENSION_VOLUME:-noname-extensions}"
+	printf '\n%s数据与磁盘%s\n' "$C_HEAD" "$C_RESET"
+	if docker volume inspect "$volume" >/dev/null 2>&1; then
+		printf '  扩展卷 : %s（%s）\n' "$volume" "$(volume_size "$volume")"
+	else
+		printf '  扩展卷 : %s（尚未创建）\n' "$volume"
+	fi
+	local img_size
+	img_size="$(docker image inspect -f '{{ .Size }}' "$(image_ref)" 2>/dev/null || true)"
+	[ -n "$img_size" ] && printf '  镜像占用 : %s\n' "$(human_size "$img_size")"
+	printf '  %s提示：非运行状态可以用 %s update --check 检查新版本%s\n' "$C_DIM" "$PROG" "$C_RESET"
+}
+
+volume_size() {
+	local volume="$1" size
+	size="$(docker run --rm -v "$volume:/data:ro" --entrypoint /bin/sh "$(image_ref)" -c 'du -sh /data 2>/dev/null | cut -f1' 2>/dev/null || true)"
+	[ -n "$size" ] || size="未知"
+	printf '%s' "$size"
+}
+
+# ---------------------------------------------------------------------------
+# 命令实现
+# ---------------------------------------------------------------------------
+
+# 启动前检查端口是否已被其他进程/容器占用（仅在服务尚未创建时检查）
+check_port_available() {
+	local port="$1" label="$2" in_use=0 owners=""
+	[ -n "$port" ] || return 0
+	if command -v ss >/dev/null 2>&1; then
+		ss -lntH "sport = :$port" 2>/dev/null | grep -q . && in_use=1
+	elif command -v netstat >/dev/null 2>&1; then
+		netstat -lnt 2>/dev/null | awk '{ print $4 }' | grep -Eq "(^|:)$port\$" && in_use=1
+	fi
+	if [ "$in_use" = "1" ]; then
+		warn "$label 端口 $port 已被占用，容器可能无法正常启动"
+		owners="$(docker ps --format '{{ .Names }} {{ .Ports }}' 2>/dev/null | grep -F ":$port->" || true)"
+		[ -n "$owners" ] && printf '      占用容器：%s\n' "$owners" >&2
+		return 1
+	fi
+	return 0
+}
+
+cmd_start() {
+	local force_build=0
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+		--build | -b) force_build=1 ;;
+		*) die "start 不支持的参数：$1" ;;
+		esac
+		shift
+	done
+
+	require_docker
+	load_state
+	export_compose_env
+
+	if ! any_container; then
+		check_port_available "${NONAME_WEB_PORT:-8089}" "网页服务" || true
+		check_port_available "${NONAME_ONLINE_PORT:-8082}" "联机服务" || true
+	fi
+
+	if [ "$force_build" = "1" ]; then
+		build_local
+	elif ! image_exists "$(image_ref)"; then
+		info "未找到镜像 $(image_ref)，准备构建"
+		ensure_image
+	fi
+
+	export_compose_env
+	info "启动服务"
+	compose up -d --remove-orphans
+	if ! wait_healthy 180; then
+		die "服务未能正常启动，请执行 $PROG logs 查看日志"
+	fi
+	print_access
+}
+
+cmd_kill() {
+	local purge=0
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+		--purge) purge=1 ;;
+		-y | --yes) NONAME_ASSUME_YES=1 ;;
+		*) die "kill 不支持的参数：$1" ;;
+		esac
+		shift
+	done
+
+	require_docker
+	load_state
+	export_compose_env
+
+	if [ "$purge" = "1" ] && [ "${NONAME_ASSUME_YES:-0}" != "1" ]; then
+		printf '%s--purge 会同时删除容器、扩展数据卷和部署状态，确认继续？[y/N] %s' "$C_WARN" "$C_RESET"
+		read -r reply
+		case "$reply" in
+		y | Y | yes | YES) ;;
+		*) die "已取消" ;;
+		esac
+	fi
+
+	info "停止并移除容器"
+	if [ "$purge" = "1" ]; then
+		compose down --volumes --remove-orphans
+		rm -rf "$STATE_DIR"
+		step "已删除数据卷与部署状态"
+	else
+		compose down --remove-orphans
+		step "容器已移除（镜像与扩展数据卷保留）"
+	fi
+}
+
+cmd_reboot() {
+	local recreate=0
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+		--recreate) recreate=1 ;;
+		*) die "reboot 不支持的参数：$1" ;;
+		esac
+		shift
+	done
+
+	require_docker
+	load_state
+	export_compose_env
+	ensure_image
+	export_compose_env
+
+	if ! any_container; then
+		info "服务未创建，改为启动"
+		compose up -d --remove-orphans
+	else
+		if [ "$recreate" = "1" ]; then
+			info "强制重新创建容器"
+			compose up -d --force-recreate --remove-orphans
+		else
+			info "重启服务"
+			compose restart
+		fi
+	fi
+
+	wait_healthy 120 || true
+	print_access
+}
+
+cmd_info() {
+	[ "$#" -eq 0 ] || die "info 不接受参数"
+	require_docker
+	load_state
+	print_info_inner
+}
+
+cmd_build() {
+	require_docker
+	load_state
+	build_local
+	if container_running "$(service_container web)"; then
+		export_compose_env
+		info "重新创建容器以使用新镜像"
+		compose up -d --force-recreate --remove-orphans
+		wait_healthy 120 || true
+		print_access
+	else
+		step "服务未运行，执行 $PROG start 启动"
+	fi
+}
+
+cmd_logs() {
+	require_docker
+	load_state
+	export_compose_env
+	local args=()
+	while [ "$#" -gt 0 ]; do
+		args+=("$1")
+		shift
+	done
+	compose logs --tail 200 "${args[@]}"
+}
+
+cmd_version() {
+	load_state
+	printf '%s %s\n' "$PROG" "$CLI_VERSION"
+	printf '镜像    : %s\n' "$(image_ref)"
+	printf '版本    : %s\n' "${STATE_VERSION:-未部署}"
+	printf '来源    : %s\n' "${STATE_SOURCE:-未部署}"
+	printf '更新时间: %s\n' "${STATE_UPDATED_AT:-未部署}"
+}
+
+cmd_update() {
+	local check_only=0 force=0 restart=1 prune=0 target_tag=""
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+		--check) check_only=1 ;;
+		--force) force=1 ;;
+		--no-restart) restart=0 ;;
+		--prune) prune=1 ;;
+		--tag)
+			shift
+			[ "$#" -gt 0 ] || die "--tag 需要版本号，例如 --tag v1.11.7"
+			target_tag="$1"
+			;;
+		*) die "update 不支持的参数：$1" ;;
+		esac
+		shift
+	done
+
+	require_docker
+	load_state
+
+	local current latest
+	current="$(current_version)"
+
+	if [ -n "$target_tag" ]; then
+		latest="$target_tag"
+		is_release_tag "$latest" || die "版本号格式不正确：$latest（应形如 v1.11.7）"
+	else
+		info "检查 ${RELEASE_REPO} 的最新 Release"
+		latest="$(resolve_latest_release)" || die "无法获取最新版本，请检查网络（或设置 GITHUB_TOKEN）"
+	fi
+
+	step "当前版本：$current"
+	step "最新版本：$latest"
+
+	if [ "$check_only" = "1" ]; then
+		if [ "$current" = "$latest" ]; then
+			info "已是最新版本"
+			return 0
+		fi
+		info "发现新版本：$latest（执行 $PROG update 进行更新）"
+		return 10
+	fi
+
+	if [ "$current" = "$latest" ] && [ "$force" = "0" ]; then
+		info "已是最新版本，无需更新"
+		return 0
+	fi
+
+	if [ "$force" = "0" ] && is_release_tag "$current" && version_gt "$current" "$latest"; then
+		die "当前版本 $current 高于远端 $latest，如需降级请加 --force"
+	fi
+
+	# 避免并发更新
+	mkdir -p "$STATE_DIR"
+	if command -v flock >/dev/null 2>&1; then
+		exec 9>"$STATE_DIR/update.lock"
+		flock -n 9 || die "另一个更新进程正在运行"
+	fi
+
+	local was_running=0
+	if container_running "$(service_container web)"; then was_running=1; fi
+
+	if [ "$force" = "0" ] && image_exists "$IMAGE:$latest"; then
+		# 本地已有该版本镜像（例如回滚到保留的历史版本），直接切换即可
+		info "本地已存在镜像 $IMAGE:$latest，直接切换（不重新构建）"
+		docker tag "$IMAGE:$latest" "$IMAGE:latest"
+		export NONAME_TAG="$latest"
+		export NONAME_VERSION="$latest"
+		save_state "$latest" "$latest" "release"
+	else
+		build_release "$latest" || die "更新失败，当前部署保持不变"
+	fi
+
+	export_compose_env
+	if [ "$was_running" = "1" ] && [ "$restart" = "1" ]; then
+		info "重启服务以使用新版本"
+		compose up -d --force-recreate --remove-orphans
+		if wait_healthy 180; then
+			info "更新完成：$current -> $latest"
+		else
+			warn "服务重启后未完全就绪，请执行 $PROG logs 查看"
+		fi
+	elif [ "$restart" = "0" ]; then
+		step "已跳过重启（--no-restart），执行 $PROG start 生效"
+	else
+		step "服务当前未运行，执行 $PROG start 启动新版本"
+	fi
+
+	if [ "$prune" = "1" ]; then
+		prune_images "$latest"
+	fi
+
+	print_access
+}
+
+prune_images() {
+	local keep_tag="$1" tag keep i
+	local -a tags=()
+	while IFS= read -r tag; do
+		[ -n "$tag" ] || continue
+		[ "$tag" = "$keep_tag" ] && continue
+		tags+=("$tag")
+	done < <(docker image ls "$IMAGE" --format '{{ .Tag }}' 2>/dev/null | grep -E '^v[0-9]+(\.[0-9]+)*$' | sort -V || true)
+
+	# 除当前版本外，默认再保留一个历史版本用于回滚
+	keep=$((${NONAME_KEEP_IMAGES:-2} - 1))
+	[ "$keep" -ge 0 ] || keep=0
+	for ((i = 0; i < ${#tags[@]} - keep; i++)); do
+		docker image rm "$IMAGE:${tags[$i]}" >/dev/null 2>&1 && step "已删除旧镜像 $IMAGE:${tags[$i]}"
+	done
+}
+
+# ---------------------------------------------------------------------------
+# 入口
+# ---------------------------------------------------------------------------
+
+main() {
+	local command="${1:-help}"
+	[ "$#" -gt 0 ] && shift
+
+	case "$command" in
+	start) cmd_start "$@" ;;
+	kill) cmd_kill "$@" ;;
+	reboot | restart) cmd_reboot "$@" ;;
+	info | status) cmd_info "$@" ;;
+	update) cmd_update "$@" ;;
+	build) cmd_build "$@" ;;
+	logs | log) cmd_logs "$@" ;;
+	version | -v | --version) cmd_version ;;
+	help | -h | --help) usage ;;
+	*) die "未知命令：$command（执行 $PROG help 查看用法）" ;;
+	esac
+}
+
+main "$@"
