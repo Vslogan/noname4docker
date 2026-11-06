@@ -106,7 +106,6 @@ ROOT="${NONAME_HOME:-$(resolve_root)}"
 COMPOSE_FILE="${NONAME_COMPOSE_FILE:-$ROOT/docker-compose.yml}"
 STATE_DIR="$ROOT/.noname"
 STATE_FILE="$STATE_DIR/state.env"
-LOG_DIR="$STATE_DIR/logs"
 
 [ -f "$COMPOSE_FILE" ] || die "找不到 $COMPOSE_FILE，NONAME_HOME 或 NONAME_COMPOSE_FILE 设置有误"
 
@@ -210,7 +209,9 @@ effective_tag() {
 }
 
 export_compose_env() {
-	export NONAME_TAG="$(effective_tag)"
+	local tag
+	tag="$(effective_tag)"
+	export NONAME_TAG="$tag"
 	if [ -n "$STATE_VERSION" ]; then
 		export NONAME_VERSION="$STATE_VERSION"
 	fi
@@ -561,8 +562,8 @@ state_port() {
 }
 
 print_info_inner() {
-	local svc cid status health started ports image_name image_id restart started_at
-	local name version_image volume
+	local svc cid status health started ports image_name image_id restart
+	local version_image volume
 	export_compose_env
 	version_image="$(image_version_label "$(image_ref)")"
 	[ -n "$version_image" ] && [ "$version_image" != "<no value>" ] || version_image="${STATE_VERSION:-unknown}"
@@ -644,6 +645,24 @@ volume_size() {
 # 命令实现
 # ---------------------------------------------------------------------------
 
+# 启动前检查端口是否已被其他进程/容器占用（仅在服务尚未创建时检查）
+check_port_available() {
+	local port="$1" label="$2" in_use=0 owners=""
+	[ -n "$port" ] || return 0
+	if command -v ss >/dev/null 2>&1; then
+		ss -lntH "sport = :$port" 2>/dev/null | grep -q . && in_use=1
+	elif command -v netstat >/dev/null 2>&1; then
+		netstat -lnt 2>/dev/null | awk '{ print $4 }' | grep -Eq "(^|:)$port\$" && in_use=1
+	fi
+	if [ "$in_use" = "1" ]; then
+		warn "$label 端口 $port 已被占用，容器可能无法正常启动"
+		owners="$(docker ps --format '{{ .Names }} {{ .Ports }}' 2>/dev/null | grep -F ":$port->" || true)"
+		[ -n "$owners" ] && printf '      占用容器：%s\n' "$owners" >&2
+		return 1
+	fi
+	return 0
+}
+
 cmd_start() {
 	local force_build=0
 	while [ "$#" -gt 0 ]; do
@@ -657,6 +676,11 @@ cmd_start() {
 	require_docker
 	load_state
 	export_compose_env
+
+	if ! any_container; then
+		check_port_available "${NONAME_WEB_PORT:-8089}" "网页服务" || true
+		check_port_available "${NONAME_ONLINE_PORT:-8082}" "联机服务" || true
+	fi
 
 	if [ "$force_build" = "1" ]; then
 		build_local
