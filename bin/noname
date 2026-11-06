@@ -60,7 +60,7 @@ ${C_HEAD}无名杀部署管理命令${C_RESET} v${CLI_VERSION}
 
 命令：
   start [--build]      构建（镜像不存在时）并启动全部服务
-  kill [--purge]       停止并移除容器；--purge 同时删除数据卷（扩展目录）与状态
+  kill [--purge] [-y]  停止并移除容器；--purge 同时删除数据卷（扩展目录）与状态
   reboot [--recreate]  重启服务；--recreate 强制重新创建容器
   info                 查看运行状态、端口映射、资源占用与调试信息
   update [选项]        检查并更新到 GitHub Release 最新版本，完成后自动重启
