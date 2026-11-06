@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-
 # 无名杀（noname）容器镜像
 #
 # 最终镜像只包含：
@@ -41,9 +39,11 @@ WORKDIR /src
 
 COPY . .
 
-# pnpm store 使用缓存挂载：重复构建时无需重新下载依赖
-RUN --mount=type=cache,id=noname-pnpm-store,target=/pnpm/store \
-    pnpm install --frozen-lockfile
+# 安装依赖。
+# 注意：这里不使用 BuildKit 的 `RUN --mount=type=cache` 语法——该语法要求启用 BuildKit，
+# 在未启用 BuildKit 的旧版 docker build、NAS 容器管理面板中会直接构建失败。
+# 依赖层本身仍会被 Docker 层缓存复用：只要源码没有变化，重复构建不会重新安装。
+RUN pnpm install --frozen-lockfile
 
 # 1. 构建前端静态资源，输出到 /src/dist
 # 2. 单独构建网页服务与联机服务（不参与 pnpm build 的依赖图）

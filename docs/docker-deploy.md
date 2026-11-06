@@ -23,8 +23,9 @@
 
 ## 二、环境要求
 
-- Docker Engine 20.10+（推荐 24+），带 BuildKit
+- Docker Engine 20.10+（推荐 24+）
 - Docker Compose v2（`docker compose` 子命令，或独立的 `docker-compose`）
+- 不要求启用 BuildKit：Dockerfile 同时兼容新旧构建器（NAS 的容器管理面板通常使用旧版构建器）
 - 磁盘：至少 8 GB 可用（构建期依赖 + 最终镜像）
 - 内存：构建时建议 4 GB 以上
 - 网络：首次构建需要访问 npm 源；`noname update` 还需要访问 GitHub
@@ -202,8 +203,12 @@ server {
 
 ## 九、常见问题
 
+**构建报错 `the --mount option requires BuildKit`**
+旧版 Dockerfile 使用过 BuildKit 专属的缓存挂载语法，现已移除，重新 `git pull` 后可直接构建。
+如果希望显式启用 BuildKit 获得更快的构建，可设置环境变量后重试：`DOCKER_BUILDKIT=1 noname build`。
+
 **构建很慢 / 卡在 pnpm install**
-首次构建需要下载依赖并执行 vite 构建，属正常现象；重复构建会复用 pnpm store 缓存（BuildKit cache mount）。
+首次构建需要下载依赖并执行 vite 构建，属正常现象；源码未变化时重复构建会直接复用 Docker 层缓存。
 国内网络可配置 npm 镜像，或使用 `NONAME_BUILD_EXTRA_ARGS` 追加构建参数。
 
 **`noname update` 拉取源码失败**
