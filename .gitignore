@@ -23,3 +23,7 @@ Thumbs.db
 
 # Skill for private use
 .agents/skills/*-selfuse
+
+# Docker 部署（noname 命令生成的状态与更新缓存）
+.noname/
+.env

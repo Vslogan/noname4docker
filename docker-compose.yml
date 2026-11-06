@@ -1,0 +1,75 @@
+# 无名杀 Docker Compose 部署文件
+#
+# 日常操作推荐使用配套命令（安装后可直接使用）：
+#   noname start    构建（首次）并启动全部服务
+#   noname info     查看运行状态、端口与资源占用
+#   noname kill     停止并移除容器
+#   noname reboot   重启服务
+#   noname update   检查并更新到 GitHub Release 最新版本
+#
+# 所有可配置项见 .env.example，也可以直接 `docker compose up -d`。
+
+name: ${COMPOSE_PROJECT_NAME:-noname}
+
+x-noname: &noname
+  image: ${NONAME_IMAGE:-noname}:${NONAME_TAG:-latest}
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args:
+      NODE_VERSION: ${NONAME_NODE_VERSION:-24}
+      PNPM_VERSION: ${NONAME_PNPM_VERSION:-10}
+      NONAME_VERSION: ${NONAME_VERSION:-dev}
+      NONAME_BUILD_COMMIT: ${NONAME_BUILD_COMMIT:-local}
+      NONAME_BUILD_TIME: ${NONAME_BUILD_TIME:-unknown}
+  restart: unless-stopped
+  # 用 tini 作为 PID 1，保证 docker stop / SIGTERM 能正常传递
+  init: true
+  stop_grace_period: 10s
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  # 网页服务：静态资源 + 文件读写接口（浏览器端存档/扩展导入依赖它）
+  web:
+    <<: *noname
+    command: ["web"]
+    environment:
+      NONAME_WEB_PORT: ${NONAME_WEB_PORT:-8089}
+      NONAME_BIND_HOST: ${NONAME_BIND_HOST:-0.0.0.0}
+      NONAME_DEBUG: ${NONAME_DEBUG:-0}
+    ports:
+      - "${NONAME_BIND_ADDRESS:-0.0.0.0}:${NONAME_WEB_PORT:-8089}:${NONAME_WEB_PORT:-8089}"
+    volumes:
+      # 扩展目录单独持久化，更新镜像后已导入的扩展不会丢失
+      - extensions:/app/dist/extension
+    healthcheck:
+      test: ["CMD", "node", "/app/healthcheck.mjs", "web"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # 联机服务：游戏内「联机」模式使用的 WebSocket 大厅
+  online:
+    <<: *noname
+    command: ["online"]
+    environment:
+      NONAME_ONLINE_PORT: ${NONAME_ONLINE_PORT:-8082}
+    ports:
+      - "${NONAME_BIND_ADDRESS:-0.0.0.0}:${NONAME_ONLINE_PORT:-8082}:${NONAME_ONLINE_PORT:-8082}"
+    healthcheck:
+      test: ["CMD", "node", "/app/healthcheck.mjs", "online"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  extensions:
+    name: ${NONAME_EXTENSION_VOLUME:-noname-extensions}
